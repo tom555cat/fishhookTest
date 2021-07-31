@@ -26,7 +26,11 @@
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/types.h>
+#include <mach/mach.h>
+#include <mach/vm_map.h>
+#include <mach/vm_region.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
@@ -78,15 +82,46 @@ static int prepend_rebindings(struct rebindings_entry **rebindings_head,
   return 0;
 }
 
+static vm_prot_t get_protection(void *sectionStart) {
+  mach_port_t task = mach_task_self();
+  vm_size_t size = 0;
+  vm_address_t address = (vm_address_t)sectionStart;
+  memory_object_name_t object;
+#if __LP64__
+  mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+  vm_region_basic_info_data_64_t info;
+  kern_return_t info_ret = vm_region_64(
+      task, &address, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_64_t)&info, &count, &object);
+#else
+  mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT;
+  vm_region_basic_info_data_t info;
+  kern_return_t info_ret = vm_region(task, &address, &size, VM_REGION_BASIC_INFO, (vm_region_info_t)&info, &count, &object);
+#endif
+  if (info_ret == KERN_SUCCESS) {
+    return info.protection;
+  } else {
+    return VM_PROT_READ;
+  }
+}
 static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
                                            section_t *section,
                                            intptr_t slide,
                                            nlist_t *symtab,
                                            char *strtab,
                                            uint32_t *indirect_symtab) {
-  // 在间接跳转符号表中的偏移，定位到相关section位置处
+  const bool isDataConst = strcmp(section->segname, SEG_DATA_CONST) == 0;
+  // 在间接跳转符号表中的偏移，定位到相关section位置处，
+  // section->reserved1中保存着该section在间接跳转符号表中的偏移。
   uint32_t *indirect_symbol_indices = indirect_symtab + section->reserved1;
-  // 计算section的地址，ASLR+vmaddress，section是一个指针数组，相当于得到了数组地址
+  vm_prot_t oldProtection = VM_PROT_READ;
+    if (isDataConst) {
+        // 获取rebindings的虚拟内存的权限，
+        oldProtection = get_protection(rebindings);
+        // 当前section(__got或__la_symbol_ptr)在间接跳转符号表上对应的位置权限修改为可读写
+        mprotect(indirect_symbol_indices, section->size, PROT_READ | PROT_WRITE);
+    }
+  // 计算section的地址，ASLR+vmaddress，section是一个指针数组，相当于得到了数组地址，
+  // 这里section->addr可能和vm还不太一样
   void **indirect_symbol_bindings = (void **)((uintptr_t)slide + section->addr);
   for (uint i = 0; i < section->size / sizeof(void *); i++) {
     // 从间接符号表中获取在符号表中的索引，间接符号表是一个符号表索引的数组
@@ -123,6 +158,19 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
     }
   symbol_loop:;
   }
+    if (isDataConst) {
+      int protection = 0;
+      if (oldProtection & VM_PROT_READ) {
+        protection |= PROT_READ;
+      }
+      if (oldProtection & VM_PROT_WRITE) {
+        protection |= PROT_WRITE;
+      }
+      if (oldProtection & VM_PROT_EXECUTE) {
+        protection |= PROT_EXEC;
+      }
+      mprotect(indirect_symbol_bindings, section->size, protection);
+    }
 }
 
 // 该函数首先获取__LINKEDIT，符号表(LC_SYMTAB)，间接跳转表，字符串表在内存中的位置，
@@ -142,6 +190,7 @@ static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
 
   // 跨过Mach Header内容
   uintptr_t cur = (uintptr_t)header + sizeof(mach_header_t);
+  // 遍历load commands
   for (uint i = 0; i < header->ncmds; i++, cur += cur_seg_cmd->cmdsize) {
     cur_seg_cmd = (segment_command_t *)cur;
     // 获取__LINKEDIT
