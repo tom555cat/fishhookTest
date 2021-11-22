@@ -121,7 +121,7 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
         mprotect(indirect_symbol_indices, section->size, PROT_READ | PROT_WRITE);
     }
   // 计算section的地址，ASLR+vmaddress，section是一个指针数组，相当于得到了数组地址，
-  // 这里section->addr可能和vm还不太一样
+  // 这里section->addr就是section的虚拟地址，segment的第一个section的addr就是该segment的虚拟地址；
   void **indirect_symbol_bindings = (void **)((uintptr_t)slide + section->addr);
   for (uint i = 0; i < section->size / sizeof(void *); i++) {
     // 从间接符号表中获取在符号表中的索引，间接符号表是一个符号表索引的数组
